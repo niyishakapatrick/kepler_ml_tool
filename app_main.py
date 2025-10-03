@@ -14,6 +14,41 @@ from sklearn.preprocessing import LabelEncoder
 import joblib
 import io
 import altair as alt
+import gc # Import garbage collector for memory management
+
+# --- MEMORY OPTIMIZATION FUNCTION ---
+def reduce_mem_usage(df):
+    """Iterate through all the columns of a dataframe and modify data type to reduce memory usage."""
+    start_mem = df.memory_usage().sum() / 1024**2
+    st.info(f"Initial memory usage of DataFrame: {start_mem:.2f} MB")
+    
+    for col in df.columns:
+        col_type = df[col].dtype
+        
+        if col_type != object and col_type.name != 'category' and 'datetime' not in col_type.name:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                else:
+                    df[col] = df[col].astype(np.int64)
+            else:
+                # Use float32 for most floats to save memory
+                df[col] = df[col].astype(np.float32)
+        elif col_type == object and df[col].nunique() < len(df) * 0.5:
+             # Convert low cardinality object columns to 'category'
+             df[col] = df[col].astype('category')
+
+    end_mem = df.memory_usage().sum() / 1024**2
+    st.success(f"Memory usage after optimization: {end_mem:.2f} MB ({100 * (start_mem - end_mem) / start_mem:.1f}% reduction)")
+    gc.collect() # Force garbage collection
+    return df
+# -----------------------------------------------
 
 # --- Streamlit Setup & Sidebar Configuration ---
 st.set_page_config(page_title="ML Tabular Trainer", layout="wide")
@@ -154,11 +189,21 @@ if uploaded_file is not None:
         df = pd.read_csv(uploaded_file, infer_datetime_format=True)
     else:
         df = pd.read_excel(uploaded_file, engine='openpyxl')
+    
+    # --- APPLY MEMORY OPTIMIZATION HERE ---
+    df = reduce_mem_usage(df)
+    # --------------------------------------
 
     # Dataset Preview (Data Section Color & Background)
     # APPLIED 'data-info-style' class
     st.markdown(f"<div class='card-data data-info-style'><div class='card-title-data'>🔎 Dataset Preview</div>", unsafe_allow_html=True)
-    st.dataframe(df.head(), use_container_width=True)
+    # Catch for serialization error in preview
+    try:
+        st.dataframe(df.head(), use_container_width=True)
+    except Exception as e:
+        st.warning(f"⚠️ Could not display DataFrame preview normally due to serialization issues. Falling back to plain text. Error: {e}")
+        st.text(df.head().to_string())
+        
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Data Info (Data Section Color & Background)
@@ -169,8 +214,13 @@ if uploaded_file is not None:
     
     with col_missing:
         st.subheader("Missing Values")
+        missing_df = df.isnull().sum().rename("Missing Count").to_frame()
         # Styled via CSS class 'data-info-style'
-        st.dataframe(df.isnull().sum().rename("Missing Count"))
+        try:
+            st.dataframe(missing_df)
+        except Exception as e:
+            st.warning(f"⚠️ Could not display Missing Values DataFrame normally due to serialization issues. Falling back to plain text. Error: {e}")
+            st.text(missing_df.to_string())
     
     with col_types:
         st.subheader("Data Types & Non-Null Counts")
@@ -182,19 +232,57 @@ if uploaded_file is not None:
         }).reset_index().rename(columns={'index': 'Column'})
         
         # Styled via CSS class 'data-info-style'
-        st.dataframe(data_info_df, use_container_width=True)
+        try:
+            # Explicitly convert the Dtype column to string before showing (primary fix)
+            data_info_df['Dtype'] = data_info_df['Dtype'].astype(str)
+            st.dataframe(data_info_df, use_container_width=True)
+        except Exception as e:
+            st.warning(f"⚠️ Could not display Data Types DataFrame normally due to serialization issues. Falling back to plain text. Error: {e}")
+            st.text(data_info_df.to_string())
         
     # Display overall memory usage and index info below the columns
     st.subheader("General Info:")
     buffer = io.StringIO()
-    # The info() output is still useful for RangeIndex, Memory, and Dtype summary
+    # The info() output is still useful for RangeIndex and Memory
     df.info(buf=buffer)
     s = buffer.getvalue()
-    # Remove the Data columns table part that is now displayed above
-    s = s.split('Data columns (total', 1)[0] + "Data columns summary...\n" + s.split('Data columns (total', 1)[1].split('dtypes', 1)[1].split('memory usage')[0].strip() + "\ndtypes summary...\nmemory usage..."
-    st.text(s) # This st.text is now targeted by the 'data-info-style' CSS
+    
+    # --- REVISED LOGIC FOR CLEAN GENERAL INFO OUTPUT (Human-readable, no brackets) ---
+    
+    # 1. Get the Dtype counts as a clean string/list
+    # Note: Use df.dtypes.to_frame() to retain index info for .value_counts() on dtypes
+    dtype_counts = df.dtypes.astype(str).value_counts().to_dict()
+    
+    dtype_summary = "Dtype counts (Total Columns: " + str(df.shape[1]) + "):"
+    for dtype, count in dtype_counts.items():
+        # Ensure the output is clean
+        dtype_summary += f"\n- {dtype.replace('(', '').replace(')', '').replace('[ns]', ' ')}: {count} columns"
+        
+    # 2. Extract RangeIndex and Memory Usage from df.info() output (s)
+    # Get the index info (e.g., RangeIndex: 2000 entries, 0 to 1999)
+    # Clean the index line by removing brackets
+    try:
+        range_index_line = [line for line in s.split('\n') if 'Index' in line][0].strip().replace('<', '').replace('>', '')
+    except IndexError:
+        range_index_line = "Index Info: Not Available"
+
+    # Get the memory usage line
+    try:
+        memory_usage_line = [line for line in s.split('\n') if 'memory usage' in line][0].strip()
+    except IndexError:
+        memory_usage_line = "Memory Usage: Not Available"
+    
+    # 3. Assemble the final clean output
+    clean_s = f"DataFrame Info Summary:\n"
+    clean_s += f"{range_index_line}\n"
+    clean_s += "\n"
+    clean_s += f"{dtype_summary}\n"
+    clean_s += f"{memory_usage_line}\n"
+
+    st.text(clean_s) 
     
     st.markdown("</div>", unsafe_allow_html=True)
+    # ---------------------------------------------------------------------------------
 
     # Separate numeric and categorical columns
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -227,7 +315,26 @@ if uploaded_file is not None:
         st.stop()
 
     target_col = st.selectbox("🎯 Select target column (y)", possible_targets)
+    
+    # --- CLASSIFICATION LIMIT CHECK ---
+    if task == "Classification":
+        unique_classes = df[target_col].dropna().nunique()
+        if unique_classes > 10:
+            st.warning(f"⚠️ Target column '{target_col}' has **{unique_classes} unique classes**. Classification tasks with more than 10 classes are extremely slow and memory-intensive. Task auto-switched to **Regression** to prevent crashing.")
+            task = "Regression"
+            # If the original target was numeric but the user explicitly selected 'Classification',
+            # we need to re-select from numeric targets upon switch.
+            if target_col not in numeric_cols:
+                # If the auto-switched column isn't numeric, find the first numeric one or stop.
+                if numeric_cols:
+                    target_col = st.selectbox("🎯 Select target column (y)", numeric_cols, key='reg_switch')
+                else:
+                    st.error("⚠️ Cannot switch to Regression: No numeric columns available.")
+                    st.stop()
+            
+        
     st.info(f"📌 Task selected: **{task}**, Target: **{target_col}**")
+    # ------------------------------------
 
     # FIX: Target Variable NaN handling
     if df[target_col].isnull().any():
@@ -244,8 +351,10 @@ if uploaded_file is not None:
         
         if task == "Classification":
             # --- Streamlit Plot using Altair ---
+            # Plot only the top 10 classes if there are too many (for visual clarity)
             plot_df = df[target_col].value_counts().reset_index()
             plot_df.columns = ['Class', 'Count']
+            plot_df = plot_df.head(10) # Limit for plotting speed and clarity
             
             chart = alt.Chart(plot_df).mark_bar().encode(
                 x=alt.X('Class:N', sort='-y', axis=alt.Axis(title=target_col, labelFontSize=plot_font_size*0.7, titleFontSize=plot_font_size)),
@@ -253,7 +362,7 @@ if uploaded_file is not None:
                 color=alt.value(accent_color_data),
                 tooltip=['Class', 'Count']
             ).properties(
-                title=alt.TitleParams("Class Distribution", fontSize=plot_font_size, anchor='middle'),
+                title=alt.TitleParams("Class Distribution (Top 10)", fontSize=plot_font_size, anchor='middle'),
                 # Set approximate pixel size based on scale for consistency
                 width=300 * plot_scale, 
                 height=300 * plot_scale
@@ -275,6 +384,10 @@ if uploaded_file is not None:
     # Features / Labels
     X = df.drop(columns=[target_col])
     y = df[target_col]
+    
+    # Release original DataFrame to free up memory
+    del df
+    gc.collect()
 
     # **FIX** : Handle Datetime columns which cause model training errors
     datetime_cols = X.select_dtypes(include=['datetime', 'datetime64', 'datetime64[ns]']).columns.tolist()
@@ -295,14 +408,16 @@ if uploaded_file is not None:
         st.markdown(f"<div class='card-data'><div class='card-title-data'>🛠️ Feature Encoding Options</div>", unsafe_allow_html=True)
         # Recalculate categorical_cols AFTER dropping datetime columns
         cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist() 
+        # --- NEW DEFAULT: Drop categorical columns (Index 1) ---
         encoding_choice = st.radio("How should categorical columns be handled?",
-                                   ["One-hot encode (default)", "Drop categorical columns"], index=0)
-        if encoding_choice == "One-hot encode (default)":
+                                   ["One-hot encode (Warning: Memory Intensive)", "Drop categorical columns (Default)"], index=1)
+        
+        if encoding_choice.startswith("One-hot encode"): # Checks for the new string
             before_cols = X.shape[1]
             X = pd.get_dummies(X, drop_first=True)
             after_cols = X.shape[1]
             st.success(f"✅ {len(cat_cols)} categorical columns encoded. Added {after_cols-before_cols} features.")
-        else:
+        else: # "Drop categorical columns (Default)"
             X = X.drop(columns=cat_cols)
             st.warning(f"⚠️ {len(cat_cols)} categorical columns dropped. Remaining features: {X.shape[1]}")
             
@@ -318,17 +433,34 @@ if uploaded_file is not None:
                     X[col].fillna(X[col].mode()[0], inplace=True)
                     st.info(f"ℹ️ Imputed missing values in feature **{col}** with its **mode**.")
         # FIX END
-
+        gc.collect() # Force GC after feature engineering
+        
+        # --- Store feature names BEFORE deletion ---
+        feature_names = X.columns.tolist()
+        # -------------------------------------------
+        
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col2:
         st.markdown(f"<div class='card-data'><div class='card-title-data'>🔀 Train/Test Split</div>", unsafe_allow_html=True)
         test_size = st.slider("Test size", 0.1, 0.5, 0.2)
         random_state = st.number_input("Random seed", value=42)
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
-        st.write("✅ Data split done")
+        
+        # Ensure that if the task is classification, stratification is possible
+        if task == "Classification" and len(np.unique(y)) > 1 and all(y_val >= 2 for y_val in pd.Series(y).value_counts()):
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
+            st.write("✅ Data split done with **stratification**")
+        else:
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=random_state)
+            st.write("✅ Data split done (no stratification)")
+            
         st.markdown("</div>", unsafe_allow_html=True)
-
+    
+    # --- Release original X and y dataframes immediately after split to free up memory ---
+    del X, y 
+    gc.collect() 
+    # -----------------------------------------------------------------------------------------
+    
     # Train models
     if task == "Regression":
         models = {
@@ -343,26 +475,38 @@ if uploaded_file is not None:
         }
 
     results = {}
-    for name, model in models.items():
-        try:
-            # Training happens here. Target y should be clean now.
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            if task == "Regression":
-                results[name] = {"MSE": mean_squared_error(y_test, y_pred),
-                                 "R2": r2_score(y_test, y_pred)}
-            else:
-                results[name] = {"Accuracy": accuracy_score(y_test, y_pred)}
+    
+    # --- ADDED SPINNER FOR PROGRESS INDICATION ---
+    with st.spinner(f"Training models for {task} task..."): 
+        for name, model in models.items():
+            try:
+                # Training happens here. Target y should be clean now.
+                model.fit(X_train, y_train)
+                
+                # Predict only once per model, using the retained X_test
+                y_pred = model.predict(X_test)
+                
+                if task == "Regression":
+                    results[name] = {"MSE": mean_squared_error(y_test, y_pred),
+                                     "R2": r2_score(y_test, y_pred)}
+                else:
+                    results[name] = {"Accuracy": accuracy_score(y_test, y_pred)}
 
-            # Save trained model (UI Color for Download Button)
-            filename = f"{name.replace(' ','_')}_{task}.joblib"
-            joblib.dump(model, filename)
-            with open(filename, "rb") as f:
-                st.download_button(f"💾 Download {name} Model", f, file_name=filename) 
+                # Save trained model 
+                filename = f"{name.replace(' ','_')}_{task}.joblib"
+                joblib.dump(model, filename)
+                with open(filename, "rb") as f:
+                    st.download_button(f"💾 Download {name} Model", f, file_name=filename) 
+                
+                # Force GC after each model to clean up internal objects
+                gc.collect() 
 
-        except Exception as e:
-            # This is the desired error catching/printing mechanism.
-            st.error(f"⚠️ Model `{name}` failed: {str(e)}")
+            except Exception as e:
+                st.error(f"⚠️ Model `{name}` failed: {str(e)}")
+    
+    # --- Release the large training data now, but keep X_test/y_test for evaluation ---
+    del X_train, y_train
+    gc.collect()
 
     # --- Extra Analysis (Analysis Section Color & Background) ---
     if task == "Classification" and results:
@@ -373,9 +517,29 @@ if uploaded_file is not None:
             chosen_model = st.selectbox("Choose model for evaluation", list(models.keys()))
             model = models[chosen_model]
             try:
+                # X_test is available here
                 y_pred = model.predict(X_test)
+                
+                # --- Classification Report Filtering Logic ---
+                full_report = classification_report(y_test, y_pred, zero_division=0)
+                num_classes = len(np.unique(y_test)) 
+                REPORT_THRESHOLD = 50 
+
                 st.text("Classification Report:")
-                st.text(classification_report(y_test, y_pred))
+                
+                if num_classes > REPORT_THRESHOLD:
+                    # Filter the report string to only show the summary lines
+                    report_lines = full_report.split('\n')
+                    # Keep header lines and the summary lines
+                    summary_lines = [report_lines[0], report_lines[1], report_lines[2]] 
+                    summary_lines.extend([line for line in report_lines if 'accuracy' in line or 'macro avg' in line or 'weighted avg' in line])
+                    
+                    st.warning(f"⚠️ Test set has {num_classes} unique classes. Showing only summary metrics to prevent excessive output.")
+                    st.text('\n'.join(summary_lines))
+                else:
+                    # Print the full report if the number of classes is manageable
+                    st.text(full_report)
+                # --- END Filtering Logic ---
 
                 # Apply scaled figsize and font size
                 fig, ax = plt.subplots(figsize=plot_figsize)
@@ -397,7 +561,9 @@ if uploaded_file is not None:
             model = models[chosen_model_imp]
             try:
                 importances = model.feature_importances_
-                feat_imp = pd.DataFrame({"Feature": X.columns, "Importance": importances}).sort_values(by="Importance", ascending=False)
+                # --- Use the stored feature_names list (Fixes 'X' not defined) ---
+                feat_imp = pd.DataFrame({"Feature": feature_names, "Importance": importances}).sort_values(by="Importance", ascending=False)
+                # ---------------------------------------------
 
                 # Apply scaled figsize and font size
                 fig, ax = plt.subplots(figsize=plot_figsize)
@@ -411,13 +577,22 @@ if uploaded_file is not None:
             except Exception as e:
                 st.error(f"⚠️ Could not generate feature importance: {str(e)}")
             st.markdown("</div>", unsafe_allow_html=True)
+            
+        # --- Delete test data now that analysis is complete ---
+        del X_test, y_test 
+        gc.collect() 
+        # -----------------------------------------------------------
 
     elif task == "Regression" and results:
         col1, col2 = st.columns(2)
 
         with col1:
             st.markdown(f"<div class='card-analysis'><div class='card-title-analysis'>📈 Results</div>", unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(results).T, use_container_width=True)
+            try:
+                st.dataframe(pd.DataFrame(results).T, use_container_width=True)
+            except Exception as e:
+                st.warning(f"⚠️ Could not display Results DataFrame normally due to serialization issues. Falling back to plain text. Error: {e}")
+                st.text(pd.DataFrame(results).T.to_string())
             st.markdown("</div>", unsafe_allow_html=True)
 
         with col2:
@@ -426,8 +601,10 @@ if uploaded_file is not None:
             model = models[chosen_model_imp]
             try:
                 importances = model.feature_importances_
-                feat_imp = pd.DataFrame({"Feature": X.columns, "Importance": importances}).sort_values(by="Importance", ascending=False)
-
+                # --- Use the stored feature_names list (Fixes 'X' not defined) ---
+                feat_imp = pd.DataFrame({"Feature": feature_names, "Importance": importances}).sort_values(by="Importance", ascending=False)
+                # ---------------------------------------------
+                
                 # Apply scaled figsize and font size
                 fig, ax = plt.subplots(figsize=plot_figsize)
                 sns.barplot(x="Importance", y="Feature", data=feat_imp.head(15), ax=ax, color=accent_color_analysis, edgecolor="black") 
@@ -440,6 +617,12 @@ if uploaded_file is not None:
             except Exception as e:
                 st.error(f"⚠️ Could not generate feature importance: {str(e)}")
             st.markdown("</div>", unsafe_allow_html=True)
+            
+        # --- Delete test data now that analysis is complete ---
+        del X_test, y_test 
+        gc.collect() 
+        # -----------------------------------------------------------
+
 
     # --- Inference Section (Analysis Section Color & Background) ---
     st.markdown(f"<div class='card-analysis'><div class='card-title-analysis'>🧪 Inference with Saved Model</div>", unsafe_allow_html=True)
@@ -453,9 +636,18 @@ if uploaded_file is not None:
                 new_df = pd.read_csv(new_data_file)
             else:
                 new_df = pd.read_excel(new_data_file)
+            
+            # --- APPLY MEMORY OPTIMIZATION TO NEW DATA ---
+            new_df = reduce_mem_usage(new_df)
+            # ---------------------------------------------
 
             st.write("🔎 New Data Preview")
-            st.dataframe(new_df.head(), use_container_width=True)
+            try:
+                st.dataframe(new_df.head(), use_container_width=True)
+            except Exception as e:
+                st.warning(f"⚠️ Could not display new data preview normally due to serialization issues. Falling back to plain text. Error: {e}")
+                st.text(new_df.head().to_string())
+
 
             if target_col in new_df.columns:
                 new_df = new_df.drop(columns=[target_col])
@@ -465,16 +657,21 @@ if uploaded_file is not None:
             if datetime_cols_new:
                 new_df = new_df.drop(columns=datetime_cols_new)
 
-            if encoding_choice == "One-hot encode (default)":
+            # Re-create the X data structure to match what the model expects
+            if encoding_choice.startswith("One-hot encode"): # Check if one-hot was chosen during training
+                # --- Use the stored feature_names list for alignment ---
                 new_df = pd.get_dummies(new_df, drop_first=True)
-                missing_cols = set(X.columns) - set(new_df.columns)
+                # Create missing columns and set to 0
+                missing_cols = set(feature_names) - set(new_df.columns) 
                 for col in missing_cols:
                     new_df[col] = 0
-                new_df = new_df[X.columns]
+                
+                # Align columns and drop extraneous ones based on the training features
+                new_df = new_df[feature_names] 
+                # ----------------------------------------------------------
             else:
-                # Recalculate cat_cols to exclude datetime columns that were dropped
-                cat_cols = X.select_dtypes(exclude=[np.number]).columns.tolist() 
-                new_df = new_df.drop(columns=cat_cols, errors="ignore")
+                # If "Drop categorical" was chosen, no one-hot encoding is applied, but features must be aligned.
+                new_df = new_df.drop(columns=[c for c in new_df.columns if c not in feature_names], errors='ignore')
                 
             # Impute missing values in new data features using training data logic (mean)
             for col in new_df.columns:
@@ -482,12 +679,19 @@ if uploaded_file is not None:
                     if pd.api.types.is_numeric_dtype(new_df[col]):
                         # Using mean of the new data for simplicity, though ideally should use training data mean.
                         new_df[col].fillna(new_df[col].mean(), inplace=True) 
+            
+            # Force GC after feature processing
+            gc.collect()
 
             preds = loaded_model.predict(new_df)
             new_df["Prediction"] = preds
 
             st.write("📊 Predictions")
-            st.dataframe(new_df.head(), use_container_width=True)
+            try:
+                st.dataframe(new_df.head(), use_container_width=True)
+            except Exception as e:
+                st.warning(f"⚠️ Could not display predictions DataFrame normally due to serialization issues. Falling back to plain text. Error: {e}")
+                st.text(new_df.head().to_string())
 
             new_df.to_csv("predictions.csv", index=False)
             with open("predictions.csv", "rb") as f:
